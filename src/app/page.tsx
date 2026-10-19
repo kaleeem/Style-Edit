@@ -1,12 +1,12 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Product, ProductImage } from "@/types/product";
 
 const BUCKET_NAME = process.env.NEXT_PUBLIC_SUPABASE_STORAGE_BUCKET || "product-images";
-const PAGE_SIZE = 8;
+const BATCH_SIZE = 40;
 
 interface StorefrontProduct extends Product {
   primaryImage: {
@@ -18,107 +18,186 @@ interface StorefrontProduct extends Product {
 export default function StorefrontPage() {
   const [products, setProducts] = useState<StorefrontProduct[]>([]);
   const [totalCount, setTotalCount] = useState<number>(0);
-  const [currentPage, setCurrentPage] = useState<number>(1);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isLoadingInitial, setIsLoadingInitial] = useState<boolean>(true);
+  const [isLoadingMore, setIsLoadingMore] = useState<boolean>(false);
+  const [hasMore, setHasMore] = useState<boolean>(true);
+  const [initialError, setInitialError] = useState<string | null>(null);
+  const [appendError, setAppendError] = useState<string | null>(null);
 
-  const fetchPublishedProducts = useCallback(async (page: number) => {
-    setIsLoading(true);
-    setErrorMessage(null);
+  // Synchronization refs to prevent race conditions and duplicate calls
+  const isFetchingRef = useRef<boolean>(false);
+  const hasMoreRef = useRef<boolean>(true);
+  const nextOffsetRef = useRef<number>(0);
+  const observerTargetRef = useRef<HTMLDivElement | null>(null);
 
-    try {
-      const client = getSupabaseClient();
-      const from = (page - 1) * PAGE_SIZE;
-      const to = from + PAGE_SIZE - 1;
+  // Fetch a batch of products from Supabase
+  const fetchBatch = useCallback(
+    async (offset: number, isInitial: boolean) => {
+      if (isFetchingRef.current) return;
+      isFetchingRef.current = true;
 
-      // Query published products with their related image metadata
-      const { data, count, error } = await client
-        .from("products")
-        .select(
-          `
-          id,
-          name,
-          slug,
-          description,
-          price,
-          sale_price,
-          category,
-          status,
-          created_at,
-          updated_at,
-          product_images (
-            id,
-            storage_path,
-            alt_text,
-            display_order,
-            is_primary,
-            color
-          )
-        `,
-          { count: "exact" }
-        )
-        .eq("status", "published")
-        .order("created_at", { ascending: false })
-        .range(from, to);
-
-      if (error) {
-        throw new Error(error.message || "Failed to retrieve published catalog.");
+      if (isInitial) {
+        setIsLoadingInitial(true);
+        setInitialError(null);
+      } else {
+        setIsLoadingMore(true);
+        setAppendError(null);
       }
 
-      // Map products and derive public URLs for primary images
-      const formatted: StorefrontProduct[] = (data || []).map((item) => {
-        const rawImages = (item.product_images as unknown as ProductImage[]) || [];
+      try {
+        const client = getSupabaseClient();
+        const from = offset;
+        const to = from + BATCH_SIZE - 1;
 
-        // Find designated primary image or fallback to the first image by display order
-        const primary =
-          rawImages.find((img) => img.is_primary) ||
-          [...rawImages].sort((a, b) => a.display_order - b.display_order)[0] ||
-          null;
+        // Query published products with associated image records
+        const { data, count, error } = await client
+          .from("products")
+          .select(
+            `
+            id,
+            name,
+            slug,
+            description,
+            price,
+            sale_price,
+            category,
+            status,
+            created_at,
+            updated_at,
+            product_images (
+              id,
+              storage_path,
+              alt_text,
+              display_order,
+              is_primary,
+              color
+            )
+          `,
+            { count: "exact" }
+          )
+          .eq("status", "published")
+          .order("created_at", { ascending: false })
+          .range(from, to);
 
-        let primaryImage: { publicUrl: string; altText: string } | null = null;
-
-        if (primary?.storage_path) {
-          const { data: urlData } = client.storage
-            .from(BUCKET_NAME)
-            .getPublicUrl(primary.storage_path);
-
-          primaryImage = {
-            publicUrl: urlData.publicUrl,
-            altText: primary.alt_text || item.name,
-          };
+        if (error) {
+          throw new Error(error.message || "Failed to retrieve published catalog.");
         }
 
-        return {
-          id: item.id,
-          name: item.name,
-          slug: item.slug,
-          description: item.description,
-          price: Number(item.price),
-          sale_price: item.sale_price !== null ? Number(item.sale_price) : null,
-          category: item.category,
-          status: item.status,
-          created_at: item.created_at,
-          updated_at: item.updated_at,
-          primaryImage,
-        };
-      });
+        const total = count ?? 0;
+        setTotalCount(total);
 
-      setProducts(formatted);
-      setTotalCount(count || 0);
-    } catch (err: unknown) {
-      const msg =
-        err instanceof Error ? err.message : "An unexpected error occurred while loading products.";
-      setErrorMessage(msg);
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
+        // Derive public image URLs for primary assets
+        const formatted: StorefrontProduct[] = (data || []).map((item) => {
+          const rawImages = (item.product_images as unknown as ProductImage[]) || [];
 
+          // Find designated primary image or fallback to lowest display_order
+          const primary =
+            rawImages.find((img) => img.is_primary) ||
+            [...rawImages].sort((a, b) => a.display_order - b.display_order)[0] ||
+            null;
+
+          let primaryImage: { publicUrl: string; altText: string } | null = null;
+
+          if (primary?.storage_path) {
+            const { data: urlData } = client.storage
+              .from(BUCKET_NAME)
+              .getPublicUrl(primary.storage_path);
+
+            primaryImage = {
+              publicUrl: urlData.publicUrl,
+              altText: primary.alt_text || item.name,
+            };
+          }
+
+          return {
+            id: item.id,
+            name: item.name,
+            slug: item.slug,
+            description: item.description,
+            price: Number(item.price),
+            sale_price: item.sale_price !== null ? Number(item.sale_price) : null,
+            category: item.category,
+            status: item.status,
+            created_at: item.created_at,
+            updated_at: item.updated_at,
+            primaryImage,
+          };
+        });
+
+        // Append products without duplicates
+        setProducts((prev) => {
+          if (isInitial) return formatted;
+          const existingIds = new Set(prev.map((p) => p.id));
+          const uniqueNew = formatted.filter((p) => !existingIds.has(p.id));
+          const updated = [...prev, ...uniqueNew];
+
+          const moreAvailable = updated.length < total && formatted.length === BATCH_SIZE;
+          hasMoreRef.current = moreAvailable;
+          setHasMore(moreAvailable);
+
+          return updated;
+        });
+
+        const moreAvailable = (isInitial ? formatted.length : offset + formatted.length) < total && formatted.length === BATCH_SIZE;
+        hasMoreRef.current = moreAvailable;
+        setHasMore(moreAvailable);
+
+        nextOffsetRef.current = offset + formatted.length;
+      } catch (err: unknown) {
+        const msg =
+          err instanceof Error ? err.message : "An unexpected error occurred while loading products.";
+        if (isInitial) {
+          setInitialError(msg);
+        } else {
+          setAppendError(msg);
+        }
+      } finally {
+        setIsLoadingInitial(false);
+        setIsLoadingMore(false);
+        isFetchingRef.current = false;
+      }
+    },
+    []
+  );
+
+  // Initial load
   useEffect(() => {
-    fetchPublishedProducts(currentPage);
-  }, [currentPage, fetchPublishedProducts]);
+    nextOffsetRef.current = 0;
+    hasMoreRef.current = true;
+    fetchBatch(0, true);
+  }, [fetchBatch]);
 
-  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
+  // Load next batch function for observer or manual retry
+  const loadNextBatch = useCallback(() => {
+    if (!hasMoreRef.current || isFetchingRef.current) return;
+    fetchBatch(nextOffsetRef.current, false);
+  }, [fetchBatch]);
+
+  // Continuous scroll using native IntersectionObserver
+  useEffect(() => {
+    const sentinel = observerTargetRef.current;
+    if (!sentinel) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const [entry] = entries;
+        if (entry.isIntersecting && hasMoreRef.current && !isFetchingRef.current) {
+          loadNextBatch();
+        }
+      },
+      {
+        root: null,
+        rootMargin: "350px", // Trigger fetch smoothly before user hits the bottom
+        threshold: 0,
+      }
+    );
+
+    observer.observe(sentinel);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [loadNextBatch]);
 
   return (
     <div className="space-y-10">
@@ -143,19 +222,19 @@ export default function StorefrontPage() {
 
       {/* Main Catalog Section */}
       <section className="space-y-6">
-        {/* Section Header & Count */}
+        {/* Section Header & Dynamic Count */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-neutral-200 pb-4">
           <div>
             <h2 className="text-xl font-bold tracking-tight text-neutral-900">
               Published Catalog
             </h2>
             <p className="text-xs text-neutral-500 mt-0.5">
-              Live products fetched from Supabase PostgreSQL & Storage
+              Continuous live catalog feed from Supabase PostgreSQL & Storage (40 items/batch)
             </p>
           </div>
 
           <div className="text-xs text-neutral-500 font-medium">
-            {isLoading ? (
+            {isLoadingInitial ? (
               <span>Loading catalog...</span>
             ) : totalCount > 0 ? (
               <span>
@@ -165,8 +244,8 @@ export default function StorefrontPage() {
           </div>
         </div>
 
-        {/* Error State */}
-        {errorMessage && (
+        {/* Initial Error State */}
+        {initialError && (
           <div className="bg-rose-50 border border-rose-200 rounded-xl p-6 text-center space-y-3">
             <div className="w-10 h-10 rounded-full bg-rose-100 text-rose-700 flex items-center justify-center mx-auto">
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -175,11 +254,11 @@ export default function StorefrontPage() {
             </div>
             <div className="space-y-1">
               <h3 className="text-sm font-semibold text-rose-900">Unable to load published products</h3>
-              <p className="text-xs text-rose-700 font-mono">{errorMessage}</p>
+              <p className="text-xs text-rose-700 font-mono">{initialError}</p>
             </div>
             <button
               type="button"
-              onClick={() => fetchPublishedProducts(currentPage)}
+              onClick={() => fetchBatch(0, true)}
               className="inline-flex items-center px-4 py-2 bg-neutral-900 text-white rounded-lg text-xs font-semibold hover:bg-neutral-800 transition-colors"
             >
               Retry Connection
@@ -187,8 +266,8 @@ export default function StorefrontPage() {
           </div>
         )}
 
-        {/* Loading Skeletons */}
-        {isLoading && !errorMessage && (
+        {/* Initial Loading Skeletons */}
+        {isLoadingInitial && !initialError && (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
             {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
               <div
@@ -206,8 +285,8 @@ export default function StorefrontPage() {
           </div>
         )}
 
-        {/* Empty State */}
-        {!isLoading && !errorMessage && products.length === 0 && (
+        {/* Empty Catalog State */}
+        {!isLoadingInitial && !initialError && products.length === 0 && (
           <div className="bg-white border border-neutral-200 rounded-2xl p-12 text-center space-y-4 shadow-2xs">
             <div className="w-14 h-14 rounded-full bg-neutral-100 flex items-center justify-center mx-auto text-neutral-400">
               <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -233,8 +312,8 @@ export default function StorefrontPage() {
           </div>
         )}
 
-        {/* Product Cards Grid */}
-        {!isLoading && !errorMessage && products.length > 0 && (
+        {/* Responsive Product Cards Grid */}
+        {products.length > 0 && (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
             {products.map((product) => {
               const hasDiscount =
@@ -259,6 +338,7 @@ export default function StorefrontPage() {
                         src={product.primaryImage.publicUrl}
                         alt={product.primaryImage.altText}
                         loading="lazy"
+                        decoding="async"
                         className="w-full h-full object-cover object-center group-hover:scale-105 transition-transform duration-500"
                       />
                     ) : (
@@ -332,32 +412,44 @@ export default function StorefrontPage() {
           </div>
         )}
 
-        {/* Pagination Controls */}
-        {!isLoading && !errorMessage && totalPages > 1 && (
-          <div className="flex items-center justify-between border-t border-neutral-200 pt-6">
+        {/* Append Error Banner (When infinite scroll batch fails) */}
+        {appendError && (
+          <div className="bg-rose-50 border border-rose-200 rounded-xl p-4 text-center space-y-2 max-w-md mx-auto">
+            <p className="text-xs text-rose-800 font-medium">
+              Could not load additional products: {appendError}
+            </p>
             <button
               type="button"
-              disabled={currentPage <= 1}
-              onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-              className="px-4 py-2 border border-neutral-300 rounded-lg text-xs font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              onClick={loadNextBatch}
+              className="inline-flex items-center px-3 py-1.5 bg-neutral-900 text-white rounded text-xs font-semibold hover:bg-neutral-800 transition-colors"
             >
-              ← Previous
-            </button>
-
-            <span className="text-xs text-neutral-500 font-medium">
-              Page <strong>{currentPage}</strong> of <strong>{totalPages}</strong>
-            </span>
-
-            <button
-              type="button"
-              disabled={currentPage >= totalPages}
-              onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
-              className="px-4 py-2 border border-neutral-300 rounded-lg text-xs font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            >
-              Next →
+              Retry Loading Next Batch
             </button>
           </div>
         )}
+
+        {/* Subtle Loading Indicator for Subsequent Batches */}
+        {isLoadingMore && (
+          <div className="flex items-center justify-center gap-2 py-6 text-xs text-neutral-500 font-medium">
+            <svg className="animate-spin h-4 w-4 text-neutral-600" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+            </svg>
+            <span>Loading more garments...</span>
+          </div>
+        )}
+
+        {/* End of Collection Notice */}
+        {!hasMore && products.length > 0 && !isLoadingInitial && (
+          <div className="text-center py-8 border-t border-neutral-200">
+            <p className="text-xs text-neutral-500 font-medium">
+              You have viewed all {products.length} products in our current collection.
+            </p>
+          </div>
+        )}
+
+        {/* Intersection Observer Sentinel Element */}
+        <div ref={observerTargetRef} className="h-4 w-full pointer-events-none" aria-hidden="true" />
       </section>
 
       {/* Architecture Verification Footer Banner */}
@@ -367,7 +459,7 @@ export default function StorefrontPage() {
             Storefront Integration Active
           </p>
           <p className="text-neutral-500 text-[11px] mt-0.5">
-            Serving real records from PostgreSQL with image delivery from Supabase Storage bucket:{" "}
+            Serving real records from PostgreSQL with continuous image delivery from Supabase Storage bucket:{" "}
             <code className="font-mono text-[10px] bg-white px-1.5 py-0.5 rounded border border-neutral-200">
               {BUCKET_NAME}
             </code>
